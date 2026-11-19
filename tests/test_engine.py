@@ -15,8 +15,9 @@
 import pytest
 
 import capa.features.address
-from capa.engine import Or
+from capa.engine import Or, Range
 from capa.features.insn import Number
+from capa.features.common import Regex, String, Substring
 from capa.features.address import (
     ThreadAddress,
     ProcessAddress,
@@ -151,3 +152,81 @@ def test_dynamic_call_address_cross_type_eq():
 
     assert (call == ava) is False
     assert (ava == call) is False
+
+
+# substrings and regexes are never keys in the feature set,
+# they match by scanning the String values that are.
+# so `count(substring(...))` and `count(string(/.../))` have to evaluate the feature
+# rather than look it up, and count the locations at which it matched.
+
+
+def test_range_counts_substring_locations():
+    # the substring is spread across multiple string values and multiple locations,
+    # and the count is the number of distinct locations, not the number of values.
+    features = {
+        String("http://evil.example/a"): {ADDR1, ADDR2},
+        String("see evil.example/b"): {ADDR3},
+        String("nothing to see here"): {ADDR4},
+    }
+
+    assert bool(Range(Substring("evil.example/"), min=3, max=3).evaluate(features)) is True
+    assert bool(Range(Substring("evil.example/"), min=3, max=None).evaluate(features)) is True
+    assert bool(Range(Substring("evil.example/"), min=4, max=None).evaluate(features)) is False
+    assert bool(Range(Substring("evil.example/"), min=None, max=2).evaluate(features)) is False
+    assert bool(Range(Substring("evil.example/"), min=0, max=2).evaluate(features)) is False
+
+    # the locations of the range are the locations of the matching strings.
+    result = Range(Substring("evil.example/"), min=1, max=None).evaluate(features)
+    assert result.locations == {ADDR1, ADDR2, ADDR3}
+
+
+def test_range_counts_regex_locations():
+    features = {
+        String("http://evil.example/a"): {ADDR1, ADDR2},
+        String("see evil.example/b"): {ADDR3},
+        String("nothing to see here"): {ADDR4},
+    }
+
+    assert bool(Range(Regex(r"/evil\.example\/[a-z]+/"), min=3, max=3).evaluate(features)) is True
+    assert bool(Range(Regex(r"/evil\.example\/[a-z]+/"), min=4, max=None).evaluate(features)) is False
+
+    result = Range(Regex(r"/evil\.example\/[a-z]+/"), min=1, max=None).evaluate(features)
+    assert result.locations == {ADDR1, ADDR2, ADDR3}
+
+
+def test_range_counts_exact_string_for_contrast():
+    # exact string features are hash lookup features: they are counted
+    # by the locations recorded for the exact feature, and only that feature.
+    features = {
+        String("http://evil.example/a"): {ADDR1, ADDR2},
+        String("see evil.example/b"): {ADDR3},
+    }
+
+    assert bool(Range(String("http://evil.example/a"), min=2, max=2).evaluate(features)) is True
+    # the same value is present at two locations, and there's no third one:
+    assert bool(Range(String("http://evil.example/a"), min=3, max=None).evaluate(features)) is False
+    # `evil.example/` occurs at three locations, but the exact string occurs at two.
+    assert bool(Range(String("http://evil.example/a"), min=1, max=2).evaluate(features)) is True
+
+
+def test_range_min_zero_short_circuit():
+    features = {String("hello world"): {ADDR1}}
+
+    # when the feature is absent and min is zero, the range matches without evaluating
+    # (and without collecting locations), whatever the max is.
+    result = Range(Substring("absent"), min=0, max=5).evaluate(features)
+    assert bool(result) is True
+    assert result.locations == frozenset()
+
+    result = Range(Regex(r"/absent/"), min=0, max=0).evaluate(features)
+    assert bool(result) is True
+    assert result.locations == frozenset()
+
+    # the same behaviour for hash lookup features is preserved.
+    result = Range(Number(0x999), min=0, max=0).evaluate(features)
+    assert bool(result) is True
+    assert result.locations == frozenset()
+
+    # but when the feature is present, the max still bounds the count.
+    assert bool(Range(Substring("hello"), min=0, max=0).evaluate(features)) is False
+    assert bool(Range(Substring("hello"), min=0, max=1).evaluate(features)) is True

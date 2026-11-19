@@ -522,3 +522,202 @@ def test_string_literal_prefilter_shared_literal():
     _, matches = match([rule_regex, rule_search], feat, 0x0)
     assert "rule 1 shared literal" in matches
     assert "rule 2 shared literal" in matches
+
+
+def test_count_substring_substring_spread_over_values_and_locations():
+    """
+    `count(substring(...))` has to count the locations at which the substring matches,
+    not the number of times an exact `Substring` feature appears in the feature set
+    (which is never, since the feature set holds the concrete String values).
+
+    the substring is spread over multiple string values and multiple locations,
+    so the expected count is the size of the union of the matching locations.
+    """
+    rule = capa.rules.Rule.from_yaml(
+        textwrap.dedent("""
+            rule:
+                meta:
+                    name: test count substring
+                    scopes:
+                        static: function
+                        dynamic: process
+                features:
+                    - count(substring(evil.example/)): 3
+            """)
+    )
+
+    addr1 = capa.features.address.AbsoluteVirtualAddress(0x401001)
+    addr2 = capa.features.address.AbsoluteVirtualAddress(0x401002)
+    addr3 = capa.features.address.AbsoluteVirtualAddress(0x401003)
+
+    hit = {
+        capa.features.common.String("http://evil.example/a"): {addr1, addr2},
+        capa.features.common.String("see evil.example/b"): {addr3},
+    }
+    _, matches = match([rule], hit, addr1)
+    assert "test count substring" in matches
+
+    # a string value that contains the substring only once at a shared location
+    # still contributes a single location to the count.
+    miss = {
+        capa.features.common.String("http://evil.example/a"): {addr1, addr2},
+        capa.features.common.String("see evil.example/b"): {addr1},
+    }
+    _, matches = match([rule], miss, addr1)
+    assert "test count substring" not in matches
+
+    # no matching values at all: the count is zero and a min=3 statement can't match.
+    _, matches = match([rule], {capa.features.common.String("clean"): {addr1}}, addr1)
+    assert "test count substring" not in matches
+
+
+def test_count_regex_spread_over_values_and_locations():
+    rule = capa.rules.Rule.from_yaml(
+        textwrap.dedent("""
+            rule:
+                meta:
+                    name: test count regex
+                    scopes:
+                        static: function
+                        dynamic: process
+                features:
+                    - count(string(/evil\\.example\\/[a-z]+/)): 2 or more
+            """)
+    )
+
+    addr1 = capa.features.address.AbsoluteVirtualAddress(0x401001)
+    addr2 = capa.features.address.AbsoluteVirtualAddress(0x401002)
+    addr3 = capa.features.address.AbsoluteVirtualAddress(0x401003)
+
+    hit = {
+        capa.features.common.String("http://evil.example/a"): {addr1},
+        capa.features.common.String("see evil.example/b"): {addr2, addr3},
+    }
+    _, matches = match([rule], hit, addr1)
+    assert "test count regex" in matches
+
+    miss = {
+        capa.features.common.String("http://evil.example/a"): {addr1},
+        capa.features.common.String("evil.example/ has no suffix"): {addr2},
+    }
+    _, matches = match([rule], miss, addr1)
+    assert "test count regex" not in matches
+
+
+def test_count_exact_string_for_contrast():
+    """
+    exact string counts are unchanged: they count the locations of that exact value.
+    this is the control case for the substring/regex counting fix.
+    """
+    rule = capa.rules.Rule.from_yaml(
+        textwrap.dedent("""
+            rule:
+                meta:
+                    name: test count exact string
+                    scopes:
+                        static: function
+                        dynamic: process
+                features:
+                    - count(string(http://evil.example/a)): 2
+            """)
+    )
+
+    addr1 = capa.features.address.AbsoluteVirtualAddress(0x401001)
+    addr2 = capa.features.address.AbsoluteVirtualAddress(0x401002)
+    addr3 = capa.features.address.AbsoluteVirtualAddress(0x401003)
+
+    hit = {capa.features.common.String("http://evil.example/a"): {addr1, addr2}}
+    _, matches = match([rule], hit, addr1)
+    assert "test count exact string" in matches
+
+    # the substring `evil.example/` occurs three times here, but the exact string
+    # still occurs twice, so the count statement keeps its meaning.
+    hit = {
+        capa.features.common.String("http://evil.example/a"): {addr1, addr2},
+        capa.features.common.String("see evil.example/b"): {addr3},
+    }
+    _, matches = match([rule], hit, addr1)
+    assert "test count exact string" in matches
+
+    miss = {capa.features.common.String("http://evil.example/a"): {addr1}}
+    _, matches = match([rule], miss, addr1)
+    assert "test count exact string" not in matches
+
+
+def test_count_min_zero_short_circuit():
+    """
+    `count(...): 0` must match when the feature is absent, for substring/regex features too,
+    while the max bound continues to apply when the feature is present.
+
+    note that a rule consisting only of zero-count statements can't be indexed
+    (see `RuleSet.match`), so we pair it with a feature that can seed the rule.
+    """
+    rule = capa.rules.Rule.from_yaml(
+        textwrap.dedent("""
+            rule:
+                meta:
+                    name: test count min zero
+                    scopes:
+                        static: function
+                        dynamic: process
+                features:
+                    - and:
+                        - number: 1
+                        - count(substring(absent)): 0
+                        - count(string(/also-absent/)): 0
+            """)
+    )
+
+    addr1 = capa.features.address.AbsoluteVirtualAddress(0x401001)
+    seeded = {
+        capa.features.insn.Number(1): {addr1},
+        capa.features.common.String("clean"): {addr1},
+    }
+    _, matches = match([rule], seeded, addr1)
+    assert "test count min zero" in matches
+
+    seeded[capa.features.common.String("this contains absent")] = {addr1}
+    _, matches = match([rule], seeded, addr1)
+    assert "test count min zero" not in matches
+
+
+def test_count_substring_and_regex_nested_in_and_or_not():
+    """
+    counted substring/regex statements are statements like any other:
+    they compose with and/or/not.
+    """
+    rule = capa.rules.Rule.from_yaml(
+        textwrap.dedent("""
+            rule:
+                meta:
+                    name: test count composition
+                    scopes:
+                        static: function
+                        dynamic: process
+                features:
+                    - and:
+                        - count(substring(evil.example/)): 3
+                        - or:
+                            - count(string(/evil\\.example\\/[a-z]+/)): 3
+                            - number: 1
+                        - not:
+                            - count(substring(clean.example/)): 1 or more
+            """)
+    )
+
+    addr1 = capa.features.address.AbsoluteVirtualAddress(0x401001)
+    addr2 = capa.features.address.AbsoluteVirtualAddress(0x401002)
+    addr3 = capa.features.address.AbsoluteVirtualAddress(0x401003)
+
+    hit = {
+        capa.features.common.String("http://evil.example/a"): {addr1, addr2},
+        capa.features.common.String("see evil.example/b"): {addr3},
+    }
+    _, matches = match([rule], hit, addr1)
+    assert "test count composition" in matches
+
+    # the `not` branch becomes true, so the whole conjunction fails.
+    hit_with_clean = dict(hit)
+    hit_with_clean[capa.features.common.String("clean.example/ here")] = {addr3}
+    _, matches = match([rule], hit_with_clean, addr1)
+    assert "test count composition" not in matches

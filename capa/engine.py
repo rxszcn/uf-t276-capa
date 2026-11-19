@@ -229,15 +229,40 @@ class Range(Statement):
         self.min = min if min is not None else 0
         self.max = max if max is not None else ((1 << 64) - 1)
 
+    def _locate(self, features: FeatureSet) -> Iterable[Address]:
+        """
+        collect the locations at which the child feature is found.
+
+        most features are hashable and used directly as keys in the feature set,
+        so we can just look them up.
+
+        substring and regex features are different: they are never stored in the feature set
+        (the set contains the concrete String values, like `String("http://example.com")`),
+        and they match by scanning those values. so, to count them we have to evaluate them,
+        collecting every matching string value. we disable short circuiting here because the
+        count statement needs the complete set of matches, not just the first one.
+        """
+        child = self.child
+        if isinstance(child, (capa.features.common.Substring, capa.features.common.Regex)):
+            return child.evaluate(features, short_circuit=False).locations
+
+        return features.get(child, [])
+
     def evaluate(self, features: FeatureSet, short_circuit=True):
         capa.perf.counters["evaluate.feature"] += 1
         capa.perf.counters["evaluate.feature.range"] += 1
 
-        count = len(features.get(self.child, []))
+        # the count of a feature is the number of distinct locations at which it is found.
+        #
+        # for substring and regex features, this is the union of the locations of every
+        # string value that matched: a value that contains the pattern contributes all of
+        # its locations, and an address shared by multiple matching values is only counted once.
+        locations = self._locate(features)
+        count = len(locations)
         if self.min == 0 and count == 0:
             return Result(True, self, [])
 
-        return Result(self.min <= count <= self.max, self, [], locations=features.get(self.child))
+        return Result(self.min <= count <= self.max, self, [], locations=locations)
 
     def __str__(self):
         if self.max == ((1 << 64) - 1):
